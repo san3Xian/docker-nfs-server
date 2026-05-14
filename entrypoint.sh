@@ -47,6 +47,7 @@ readonly PATH_BIN_NFSD='/usr/sbin/rpc.nfsd'
 readonly PATH_BIN_RPCBIND='/sbin/rpcbind'
 readonly PATH_BIN_RPC_SVCGSSD='/usr/sbin/rpc.svcgssd'
 readonly PATH_BIN_STATD='/sbin/rpc.statd'
+readonly PATH_BIN_CAPSH='capsh'
 
 readonly PATH_FILE_ETC_EXPORTS='/etc/exports'
 readonly PATH_FILE_ETC_IDMAPD_CONF='/etc/idmapd.conf'
@@ -56,7 +57,7 @@ readonly PATH_FILE_ETC_KRB5_KEYTAB='/etc/krb5.keytab'
 readonly MOUNT_PATH_NFSD='/proc/fs/nfsd'
 readonly MOUNT_PATH_RPC_PIPEFS='/var/lib/nfs/rpc_pipefs'
 
-readonly REGEX_EXPORTS_LINES_TO_SKIP='^\s*#|^\s*$'
+readonly REGEX_EXPORTS_LINES_TO_SKIP='^[[:space:]]*#|^[[:space:]]*$'
 
 readonly LOG_LEVEL_INFO='INFO'
 readonly LOG_LEVEL_DEBUG='DEBUG'
@@ -165,7 +166,7 @@ stop_mount() {
   local -r path=$1
   local -r type=$(basename "$path")
 
-  if mount | grep -Eq ^"$type on $path\\s+"; then
+  if mount | grep -Eq "^$type on $path[[:space:]]+"; then
 
     local args=()
     if is_logging_debug; then
@@ -255,6 +256,11 @@ is_logging_debug() {
   [[ -n ${state[$STATE_IS_LOGGING_DEBUG]} ]] && return 0 || return 1
 }
 
+is_positive_integer() {
+
+  [[ $1 =~ ^[0-9]+$ ]] && return 0 || return 1
+}
+
 is_kernel_module_loaded() {
 
   local -r module=$1
@@ -273,7 +279,16 @@ is_kernel_module_loaded() {
 
 is_granted_linux_capability() {
 
-  if capsh --print | grep -Eq "^Current: = .*,?${1}(,|$)"; then
+  local -r requested_capability="cap_${1#cap_}"
+
+  command -v "$PATH_BIN_CAPSH" > /dev/null 2>&1
+  on_failure bail "missing $PATH_BIN_CAPSH. ensure the container image includes libcap-utils"
+
+  local effective_capabilities
+  effective_capabilities=$("$PATH_BIN_CAPSH" --decode="$(awk '/^CapEff:/ {print $2}' /proc/self/status)")
+  on_failure bail 'unable to inspect effective Linux capabilities'
+
+  if echo "$effective_capabilities" | grep -Eq "(^|[=,])${requested_capability}(,|$)"; then
     return 0
   fi
 
@@ -316,9 +331,13 @@ assert_kernel_mod() {
 assert_port() {
 
   local -r variable_name=$1
-  local -r value=${!variable_name}
+  local -r value="${!variable_name}"
 
-  if [[ -n "$value" && ( "$value" -lt 1 || "$value" -gt 65535 ) ]]; then
+  if [[ -z "$value" ]]; then
+    return
+  fi
+
+  if ! is_positive_integer "$value" || (( 10#$value < 1 || 10#$value > 65535 )); then
     bail "please set $variable_name to an integer between 1 and 65535 inclusive"
   fi
 }
@@ -334,9 +353,13 @@ init_state_logging() {
   local incoming_log_level="${!ENV_VAR_NFS_LOG_LEVEL:-$LOG_LEVEL_INFO}"
   local -r normalized_log_level="${incoming_log_level^^}"
 
-  if ! echo "$normalized_log_level" | grep -Eq 'DEBUG|INFO'; then
-    bail "the only acceptable values for $ENV_VAR_NFS_LOG_LEVEL are: DEBUG, INFO"
-  fi
+  case "$normalized_log_level" in
+    "$LOG_LEVEL_INFO" | "$LOG_LEVEL_DEBUG")
+      ;;
+    *)
+      bail "the only acceptable values for $ENV_VAR_NFS_LOG_LEVEL are: DEBUG, INFO"
+      ;;
+  esac
 
   state[$STATE_LOG_LEVEL]=$normalized_log_level;
   state[$STATE_IS_LOGGING_INFO]=1
@@ -355,7 +378,7 @@ init_state_nfsd_thread_count() {
 
     count="${!ENV_VAR_NFS_SERVER_THREAD_COUNT}"
 
-    if [[ $count -lt 1 ]]; then
+    if ! is_positive_integer "$count" || (( 10#$count < 1 )); then
       bail "please set $ENV_VAR_NFS_SERVER_THREAD_COUNT to a positive integer"
     fi
 
@@ -434,7 +457,7 @@ init_exports() {
     local candidate_export_var
 
     # collect all candidate environment variable names
-    candidate_export_vars=$(compgen -A variable | grep -E 'NFS_EXPORT_[0-9]+' | sort)
+    candidate_export_vars=$(compgen -A variable | grep -E '^NFS_EXPORT_[0-9]+$' | sort)
     on_failure bail 'failed to detect NFS_EXPORT_* variables'
 
     if [[ -z "$candidate_export_vars" ]]; then
@@ -567,11 +590,13 @@ boot_helper_start_non_daemon() {
 
   local -r bg_pid=$!
 
-  # somewhat arbitrary assumption that if the process isn't dead already, it will die within a millisecond. for our
-  # purposes this works just fine, but if someone has a better solution please open a PR.
-  sleep .001
-  kill -0 $bg_pid 2> /dev/null
-  on_failure stop "$process failed"
+  local -i attempts=10
+  while [[ $attempts -gt 0 ]]; do
+    kill -0 "$bg_pid" 2> /dev/null
+    on_failure stop "$process failed"
+    sleep 0.1
+    attempts=$(( attempts - 1 ))
+  done
 }
 
 ######################################################################################
@@ -626,10 +651,12 @@ boot_main_rpcbind() {
   #     privileged port
 
   local args=('-s')
+  local func=boot_helper_start_daemon
   if is_logging_debug; then
-    arg+=('-d')
+    args+=('-d')
+    func=boot_helper_start_non_daemon
   fi
-  boot_helper_start_daemon 'starting rpcbind' $PATH_BIN_RPCBIND "${args[@]}"
+  $func 'starting rpcbind' $PATH_BIN_RPCBIND "${args[@]}"
 }
 
 boot_main_idmapd() {
