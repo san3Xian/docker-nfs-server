@@ -138,10 +138,33 @@ mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
 
 ### 为什么 `showmount -e` 正常，通过NFS v3 也能挂载，但 `NFSv4` 挂载 `:/data` 失败？(提示: mounting 127.0.0.1:/xxxx failed, reason given by server: No such file or directory)
 
-这是 `NFSv3` 和 `NFSv4` 的路径语义不同，不一定是服务没起来。
+这通常不是服务没起来，也不一定是 `rpc.nfsd` 参数有问题，更常见的原因是 `NFSv3` 和 `NFSv4` 的挂载路径语义本来就不同。
+
+可以先把结论记住：
 
 - `NFSv3` 更接近“按导出路径直接挂”
-- `NFSv4` 走的是 pseudo-root，客户端看到的路径是相对于 `fsid=0` 根来的
+- `NFSv4` 不是按 `mountd` 看到的“真实导出路径”来挂
+- `NFSv4` 走的是内核 `nfsd` 提供的 pseudo-root
+- 客户端看到的 `:/data`，其实是“相对于 `fsid=0` 根的路径”
+
+#### 为什么 `NFSv4` 会和 `NFSv3` 不一样
+
+官方 `exports(5)` 里明确说明：`NFSv4` 有一个特殊的根文件系统，也就是 “distinguished filesystem”，需要用 `fsid=root` 或 `fsid=0` 指定。客户端访问的路径，都是相对于这个根来的。
+
+同时，`rpc.mountd(8)` 也明确说明：`NFSv4` 不使用单独的 `MOUNT` 协议，挂载动作是通过普通 NFS 请求直接交给内核里的 `nfsd` 处理的。
+
+这两点叠在一起，就导致：
+
+1. `showmount -e` 看到的内容，更多反映的是 `mountd` / `MOUNT` 协议这一侧的信息
+1. `NFSv4` 客户端真正挂载时，走的却是内核 `nfsd` 的 pseudo-root 视角
+1. 所以“`showmount -e` 正常”并不等于“`NFSv4` 的挂载路径一定写对了”
+
+参考：
+
+- `exports(5)`：`NFSv4` 需要 `fsid=root` / `fsid=0`  
+  https://man7.org/linux/man-pages/man5/exports.5.html
+- `rpc.mountd(8)`：`NFSv4` 挂载不使用单独的 `MOUNT` 协议  
+  https://man7.org/linux/man-pages/man8/mountd.8.html
 
 例如下面这组导出：
 
@@ -158,7 +181,13 @@ mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
 /exports/data             /data
 ```
 
-所以客户端挂载 `127.0.0.1:/data` 时，实际访问的是服务器里的 `/exports/data`，不是 `/data`。
+所以这时：
+
+- 客户端挂载 `127.0.0.1:/data`
+- 实际访问的是服务器里的 `/exports/data`
+- 不是服务器里的 `/data`
+
+这就是最容易混淆的地方。
 
 如果你只是导出了：
 
@@ -166,7 +195,66 @@ mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
 -e NFS_EXPORT_0='/data *(rw,...)'
 ```
 
-那它对 `NFSv3` 通常没问题，但对 `NFSv4` 不一定成立。
+那么：
+
+- 对 `NFSv3` 来说，客户端挂载 `127.0.0.1:/data` 往往没问题
+- 对 `NFSv4` 来说，客户端挂载 `127.0.0.1:/data` 就不一定成立
+
+因为这时候你并没有明确告诉 `NFSv4`：“哪一个导出应该作为 pseudo-root 的根”。
+
+#### 用一句话理解这个现象
+
+`NFSv3` 更像是在问服务器：“把你导出的 `/data` 给我挂过来。”
+
+`NFSv4` 更像是在问服务器：“从你的 `fsid=0` 根开始，给我找一个叫 `/data` 的路径。”
+
+如果你的 `fsid=0` 根本不是 `/`，或者根本没有正确设置，那么 `NFSv4` 客户端请求 `:/data` 时，就会收到：
+
+```txt
+No such file or directory
+```
+
+#### 对应到实际排查，通常可以这样理解
+
+1. `showmount -e` 能看到 `/data`
+   这只能说明 `NFSv3` / `mountd` 这一侧看起来是通的
+1. `mount -t nfs -o nfsvers=3 server:/data /mnt` 成功
+   说明按 `NFSv3` 语义，导出本身基本没问题
+1. `mount -t nfs -o nfsvers=4.1 server:/data /mnt` 失败
+   往往说明失败点在 `NFSv4` 的 pseudo-root 路径映射，而不是服务进程没启动
+
+#### 该怎么改
+
+常见做法有两种：
+
+1. 把真实目录直接当成 `NFSv4` 根
+
+   例如：
+
+   ```bash
+   -e NFS_EXPORT_0='/data *(rw,...,fsid=0)'
+   ```
+
+   这时客户端应该挂载：
+
+   ```bash
+   server:/
+   ```
+
+1. 显式构造一个 `NFSv4` 根，再把数据目录放到它下面
+
+   例如：
+
+   ```bash
+   -e NFS_EXPORT_0='/exports *(ro,fsid=0,crossmnt,no_subtree_check)'
+   -e NFS_EXPORT_1='/exports/data *(rw,...)'
+   ```
+
+   这时客户端挂载：
+
+   ```bash
+   server:/data
+   ```
 
 PS: 根据man page说明，showmount 对 NFSv4 的支持也不太完善，所以它的输出不一定能反映实际的导出状态。
 > BUGS  
