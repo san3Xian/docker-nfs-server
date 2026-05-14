@@ -1,3 +1,4 @@
+[TOC]
 # docker-nfs-server
 
 一个轻量 NFS Server 容器镜像，基于上游 `erichough/nfs-server` 调整。
@@ -531,7 +532,7 @@ nerdctl run --net host --privileged \
 ## 本地构建
 
 ```bash
-nerdctl build -t docker-nfs-server:test .
+docker build -t docker-nfs-server:test .
 ```
 
 ## 致谢
