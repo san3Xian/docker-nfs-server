@@ -53,6 +53,8 @@ readonly PATH_FILE_ETC_EXPORTS='/etc/exports'
 readonly PATH_FILE_ETC_IDMAPD_CONF='/etc/idmapd.conf'
 readonly PATH_FILE_ETC_KRB5_CONF='/etc/krb5.conf'
 readonly PATH_FILE_ETC_KRB5_KEYTAB='/etc/krb5.keytab'
+readonly PATH_FILE_NFSD_PORTLIST='/proc/fs/nfsd/portlist'
+readonly PATH_FILE_NFSD_THREADS='/proc/fs/nfsd/threads'
 
 readonly MOUNT_PATH_NFSD='/proc/fs/nfsd'
 readonly MOUNT_PATH_RPC_PIPEFS='/var/lib/nfs/rpc_pipefs'
@@ -261,6 +263,114 @@ is_positive_integer() {
   [[ $1 =~ ^[0-9]+$ ]] && return 0 || return 1
 }
 
+count_cpus_in_list() {
+
+  local -r cpu_list="$1"
+  local total=0
+  local chunk
+  local -a chunks
+
+  IFS=',' read -r -a chunks <<< "$cpu_list"
+  for chunk in "${chunks[@]}"; do
+
+    if [[ $chunk =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      total=$(( total + BASH_REMATCH[2] - BASH_REMATCH[1] + 1 ))
+    elif [[ $chunk =~ ^[0-9]+$ ]]; then
+      total=$(( total + 1 ))
+    else
+      return 1
+    fi
+  done
+
+  echo "$total"
+}
+
+get_cpuset_cpu_count() {
+
+  local path
+  for path in /sys/fs/cgroup/cpuset.cpus.effective /sys/fs/cgroup/cpuset.cpus; do
+
+    if [[ ! -r "$path" ]]; then
+      continue
+    fi
+
+    local cpuset
+    cpuset="$(tr -d '\n' < "$path")"
+    if [[ -z "$cpuset" ]]; then
+      continue
+    fi
+
+    local count
+    count="$(count_cpus_in_list "$cpuset")" || continue
+    if is_positive_integer "$count" && (( 10#$count > 0 )); then
+      echo "$count"
+      return 0
+    fi
+  done
+
+  echo 0
+}
+
+get_cgroup_quota_cpu_count() {
+
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+
+    local quota period
+    read -r quota period < /sys/fs/cgroup/cpu.max
+    if [[ "$quota" != 'max' ]] && is_positive_integer "$quota" && is_positive_integer "$period" && (( 10#$period > 0 )); then
+      echo $(( (10#$quota + 10#$period - 1) / 10#$period ))
+      return 0
+    fi
+  fi
+
+  if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+
+    local quota period
+    quota="$(tr -d '\n' < /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+    period="$(tr -d '\n' < /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+    if is_positive_integer "$quota" && is_positive_integer "$period" && (( 10#$period > 0 )); then
+      echo $(( (10#$quota + 10#$period - 1) / 10#$period ))
+      return 0
+    fi
+  fi
+
+  echo 0
+}
+
+get_available_cpu_count() {
+
+  local count=0
+
+  local cpuset_count
+  cpuset_count="$(get_cpuset_cpu_count)"
+  if is_positive_integer "$cpuset_count" && (( 10#$cpuset_count > 0 )); then
+    count="$cpuset_count"
+  fi
+
+  local quota_count
+  quota_count="$(get_cgroup_quota_cpu_count)"
+  if is_positive_integer "$quota_count" && (( 10#$quota_count > 0 )); then
+
+    if (( 10#$count == 0 || 10#$quota_count < 10#$count )); then
+      count="$quota_count"
+    fi
+  fi
+
+  if (( 10#$count == 0 )) && command -v nproc > /dev/null 2>&1; then
+    count="$(nproc)"
+  fi
+
+  if ! is_positive_integer "$count" || (( 10#$count < 1 )); then
+    count="$(getconf _NPROCESSORS_ONLN 2> /dev/null || true)"
+  fi
+
+  if ! is_positive_integer "$count" || (( 10#$count < 1 )); then
+    count="$(grep -Ec '^processor' /proc/cpuinfo)"
+  fi
+
+  echo "$count"
+}
+
 is_kernel_module_loaded() {
 
   local -r module=$1
@@ -275,6 +385,16 @@ is_kernel_module_loaded() {
 
   log "kernel module $module is missing"
   return 1
+}
+
+get_nfsd_thread_count() {
+
+  if [[ ! -r "$PATH_FILE_NFSD_THREADS" ]]; then
+    echo 0
+    return 0
+  fi
+
+  cat "$PATH_FILE_NFSD_THREADS"
 }
 
 is_granted_linux_capability() {
@@ -388,11 +508,11 @@ init_state_nfsd_thread_count() {
 
   else
 
-    count="$(grep -Ec ^processor /proc/cpuinfo)"
+    count="$(get_available_cpu_count)"
     on_failure bail "unable to detect CPU count. set $ENV_VAR_NFS_SERVER_THREAD_COUNT environment variable"
 
     if is_logging_debug; then
-      log "will use $count rpc.nfsd server thread(s) (1 thread per CPU)"
+      log "will use $count rpc.nfsd server thread(s) based on available container CPU capacity"
     fi
 
   fi
@@ -550,7 +670,7 @@ boot_helper_mount() {
   on_failure stop "unable to mount $type filesystem onto $path"
 }
 
-boot_helper_get_version_flags() {
+boot_helper_get_mountd_version_flags() {
 
   local -r requested_version="${state[$STATE_NFS_VERSION]}"
   local flags=('--nfs-version' "$requested_version" '--no-nfs-version' 2)
@@ -564,6 +684,71 @@ boot_helper_get_version_flags() {
   fi
 
   echo "${flags[@]}"
+}
+
+boot_helper_get_nfsd_version_flags() {
+
+  local -r requested_version="${state[$STATE_NFS_VERSION]}"
+  local flags=('--nfs-version' "$requested_version")
+
+  if ! is_nfs3_enabled; then
+    flags+=('--no-nfs-version' 3)
+  fi
+
+  if [[ "$requested_version" = '3' ]]; then
+    flags+=('--no-nfs-version' 4)
+  fi
+
+  echo "${flags[@]}"
+}
+
+boot_helper_assert_nfsd_started() {
+
+  local threads
+  threads="$(get_nfsd_thread_count)"
+  on_failure bail 'unable to inspect kernel nfsd thread count'
+
+  if ! is_positive_integer "$threads" || (( 10#$threads < 1 )); then
+    bail 'kernel nfsd did not start any server threads'
+  fi
+
+  local -r port="${state[$STATE_NFSD_PORT]}"
+  if [[ -r "$PATH_FILE_NFSD_PORTLIST" ]]; then
+
+    if ! grep -Eq "^tcp[[:space:]]+$port$" "$PATH_FILE_NFSD_PORTLIST"; then
+      log_warning "kernel nfsd is running with $threads thread(s), but tcp port $port is not listed in $PATH_FILE_NFSD_PORTLIST. if nfsd was already running, rpc.nfsd may have ignored the requested port/protocol settings"
+    elif is_logging_debug; then
+      log "kernel nfsd is listening on tcp port $port"
+    fi
+
+    if is_nfs3_enabled; then
+
+      if ! grep -Eq "^udp[[:space:]]+$port$" "$PATH_FILE_NFSD_PORTLIST"; then
+        log_warning "kernel nfsd is running with $threads thread(s), but udp port $port is not listed in $PATH_FILE_NFSD_PORTLIST. if udp transport is required, verify that the kernel accepted the requested transport settings"
+      elif is_logging_debug; then
+        log "kernel nfsd is listening on udp port $port"
+      fi
+    fi
+  fi
+}
+
+boot_helper_assert_process_running() {
+
+  local -r process="$1"
+  local -r base="$(basename "$process")"
+  local -i attempts=20
+
+  while [[ $attempts -gt 0 ]]; do
+
+    if pidof "$base" > /dev/null 2>&1; then
+      return 0
+    fi
+
+    sleep 0.1
+    attempts=$(( attempts - 1 ))
+  done
+
+  return 1
 }
 
 boot_helper_start_daemon() {
@@ -628,7 +813,7 @@ boot_main_mountd() {
   # --port   specifies the port number used for RPC listener sockets
 
   local version_flags
-  read -r -a version_flags <<< "$(boot_helper_get_version_flags)"
+  read -r -a version_flags <<< "$(boot_helper_get_mountd_version_flags)"
   local -r port="${state[$STATE_MOUNTD_PORT]}"
   local args=('--port' "$port" "${version_flags[@]}")
   if is_logging_debug; then
@@ -637,15 +822,17 @@ boot_main_mountd() {
 
   # yes, rpc.mountd is required even for NFS v4: https://forums.gentoo.org/viewtopic-p-7724856.html#7724856
   boot_helper_start_daemon "starting rpc.mountd on port $port" $PATH_BIN_MOUNTD "${args[@]}"
+  boot_helper_assert_process_running "$PATH_BIN_MOUNTD"
+  on_failure stop 'rpc.mountd did not remain running after startup'
 }
 
 boot_main_rpcbind() {
 
   # https://linux.die.net/man/8/rpcbind
   #
-  # -d  run in debug mode. in this mode, rpcbind will not fork when it starts, will print additional information during
-  #     operation, and will abort on certain errors if -a is also specified. with this option, the name-to-address
-  #     translation consistency checks are shown in detail
+  # -d  run in debug mode. rpcbind will print additional information during operation, and will abort on certain errors
+  #     if -a is also specified. with this option, the name-to-address translation consistency checks are shown in detail
+  # -f  do not fork and become a background process
   # -s  cause rpcbind to change to the user daemon as soon as possible. this causes rpcbind to use non-privileged ports
   #     for outgoing connections, preventing non-privileged clients from using rpcbind to connect to services from a
   #     privileged port
@@ -653,10 +840,12 @@ boot_main_rpcbind() {
   local args=('-s')
   local func=boot_helper_start_daemon
   if is_logging_debug; then
-    args+=('-d')
+    args+=('-d' '-f')
     func=boot_helper_start_non_daemon
   fi
   $func 'starting rpcbind' $PATH_BIN_RPCBIND "${args[@]}"
+  boot_helper_assert_process_running "$PATH_BIN_RPCBIND"
+  on_failure stop 'rpcbind did not remain running after startup'
 }
 
 boot_main_idmapd() {
@@ -679,6 +868,8 @@ boot_main_idmapd() {
   fi
 
   $func 'starting rpc.idmapd' $PATH_BIN_IDMAPD "${args[@]}"
+  boot_helper_assert_process_running "$PATH_BIN_IDMAPD"
+  on_failure stop 'rpc.idmapd did not remain running after startup'
 }
 
 boot_main_statd() {
@@ -710,6 +901,8 @@ boot_main_statd() {
   fi
 
   $func "starting rpc.statd on port $port_in (outgoing from port $port_out)" $PATH_BIN_STATD "${args[@]}"
+  boot_helper_assert_process_running "$PATH_BIN_STATD"
+  on_failure stop 'rpc.statd did not remain running after startup'
 }
 
 boot_main_nfsd() {
@@ -726,16 +919,24 @@ boot_main_nfsd() {
   #          be checked using the nfsstat(8) program
 
   local version_flags
-  read -r -a version_flags <<< "$(boot_helper_get_version_flags)"
+  read -r -a version_flags <<< "$(boot_helper_get_nfsd_version_flags)"
   local -r threads="${state[$STATE_NFSD_THREAD_COUNT]}"
   local -r port="${state[$STATE_NFSD_PORT]}"
   local args=('--tcp' '--udp' '--port' "$port" "${version_flags[@]}" "$threads")
+
+  local existing_threads
+  existing_threads="$(get_nfsd_thread_count)"
+  on_failure bail 'unable to inspect existing kernel nfsd thread count'
+  if is_positive_integer "$existing_threads" && (( 10#$existing_threads > 0 )); then
+    log_warning "kernel nfsd already appears to be running with $existing_threads thread(s). rpc.nfsd may ignore requested port/protocol settings and only adjust the thread count"
+  fi
 
   if is_logging_debug; then
     args+=('--debug')
   fi
 
-  boot_helper_start_daemon "starting rpc.nfsd on port $port with $threads server thread(s)" $PATH_BIN_NFSD "${args[@]}"
+  boot_helper_start_daemon "configuring kernel nfsd via rpc.nfsd on port $port with $threads server thread(s)" $PATH_BIN_NFSD "${args[@]}"
+  boot_helper_assert_nfsd_started
 
   # rpcbind isn't required for NFSv4, but if it's not running then nfsd takes over 5 minutes to start up.
   # it's a bug in either nfs-utils or the kernel, and the code of both is over my head.

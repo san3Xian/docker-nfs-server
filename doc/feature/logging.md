@@ -39,7 +39,7 @@ Normal, non-debug logging will look something like this:
 ----> starting rpc.mountd on port 32767
 ----> starting rpc.statd on port 32765 (outgoing from port 32766)
 ----> starting rpc.idmapd
-----> starting rpc.nfsd on port 2049 with 16 server thread(s)
+----> configuring kernel nfsd via rpc.nfsd on port 2049 with 16 server thread(s)
 ----> starting rpc.svcgssd
 ----> all services started normally
 
@@ -95,9 +95,9 @@ exporting *:/nfs/htpc-media
 ----> starting rpc.mountd on port 32767
 ----> starting rpc.statd on port 32765 (outgoing from port 32766)
 ----> starting rpc.idmapd
-----> starting rpc.nfsd on port 2049 with 16 server thread(s)
+----> configuring kernel nfsd via rpc.nfsd on port 2049 with 16 server thread(s)
 rpc.nfsd: knfsd is currently down
-rpc.nfsd: Writing version string to kernel: -2 +3 +4 +4.1 +4.2
+rpc.nfsd: Writing version string to kernel: +3 +4 +4.1 +4.2
 rpc.nfsd: Created AF_INET TCP socket.
 rpc.nfsd: Created AF_INET UDP socket.
 rpc.nfsd: Created AF_INET6 TCP socket.
@@ -160,3 +160,5 @@ finished handling null request
 entering poll
 ...
 ```
+
+`rpc.nfsd` is usually not a long-running user-space process. It configures the kernel NFS server and then exits after the kernel threads are started. Depending on your environment, those active server threads may appear as kernel `nfsd` threads on the host, or may not appear in the container's normal `ps` output at all.

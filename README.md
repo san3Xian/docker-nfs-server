@@ -1,174 +1,308 @@
-# erichough/nfs-server
+# docker-nfs-server
 
-A lightweight, robust, flexible, and containerized NFS server.
+一个轻量 NFS Server 容器镜像，基于上游 `erichough/nfs-server` 调整。
 
-## Why?
+- 镜像地址：`ghcr.io/san3xian/docker-nfs-server`
+- 自动发布：`push`、手动触发 GitHub Actions、发布 Release
+- 支持架构：`linux/amd64`、`linux/arm64`
 
-This is the only containerized NFS server that offers **all** of the following features:
+## 这个镜像适合什么场景
 
-- small (~15MB) Alpine Linux image
-- NFS versions 3, 4, or both simultaneously
-- clean teardown of services upon termination (no lingering `nfsd` processes on Docker host)
-- flexible construction of `/etc/exports`
-- extensive server configuration via environment variables
-- human-readable logging (with a helpful [debug mode](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/logging.md))
-- *optional* bonus features
-  - [Kerberos security](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/kerberos.md)
-  - [NFSv4 user ID mapping](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/nfs4-user-id-mapping.md) via [`idmapd`](http://man7.org/linux/man-pages/man8/idmapd.8.html)
-  - [AppArmor](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/apparmor.md) compatibility
+- 想快速起一个容器化 NFS Server
+- 需要支持 `NFSv3`、`NFSv4`，或者同时支持两者
+- 希望主要通过环境变量配置导出目录，而不是手改容器内文件
 
-## Table of Contents
+## 前置条件
 
-* [Requirements](#requirements)
-* Usage
-  * [Starting the server](#starting-the-server)
-  * [Mounting filesystems from a client](#mounting-filesystems-from-a-client)
-* Optional features
-  * [Debug logging](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/logging.md)
-  * [Kerberos security](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/kerberos.md)
-  * [NFSv4 user ID mapping](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/nfs4-user-id-mapping.md)
-  * [AppArmor integration](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/apparmor.md)
-* Advanced
-  * [automatically load required kernel modules](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/auto-load-kernel-modules.md)
-  * [custom server ports](https://github.com/ehough/docker-nfs-server/blob/develop/doc/advanced/ports.md)
-  * [custom NFS versions offered](https://github.com/ehough/docker-nfs-server/blob/develop/doc/advanced/nfs-versions.md)
-  * [performance tuning](https://github.com/ehough/docker-nfs-server/blob/develop/doc/advanced/performance-tuning.md)
-* [Help!](#help)
-* [Remaining tasks](#remaining-tasks)
-* [Acknowledgements](#acknowledgements)
+1. 宿主机内核需要支持并加载这些模块：
+   `nfs`、`nfsd`
 
-## Requirements
+   如果要用 Kerberos，还需要：
+   `rpcsec_gss_krb5`
 
-1. The Docker **host** kernel will need the following kernel modules
-   - `nfs`
-   - `nfsd`
-   - `rpcsec_gss_krb5` (*only if Kerberos is used*)
+2. 容器需要额外权限，至少要有：
+   `--cap-add SYS_ADMIN`
 
-   You can manually enable these modules on the Docker host with:
-   
-   `modprobe {nfs,nfsd,rpcsec_gss_krb5}`
-   
-   or you can just allow the container to [load them automatically](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/auto-load-kernel-modules.md).
-1. The container will need to run with `CAP_SYS_ADMIN` (or `--privileged`). This is necessary as the server needs to mount several filesystems *inside* the container to support its operation, and performing mounts from inside a container is impossible without these capabilities.
-1. The container will need local access to the files you'd like to serve via NFS. You can use Docker volumes, bind mounts, files baked into a custom image, or virtually any other means of supplying files to a Docker container.
+   实际使用里更省事的方式通常是：
+   `--privileged`
 
-## Usage
+3. 容器内部必须能看到你要导出的目录。
+   常见做法就是把宿主机目录通过 `-v` 挂进去。
 
-### Starting the server
+4. 本 README 下面的命令示例使用 `nerdctl`，如果你用的是 `docker`，命令格式基本一样。
 
-Starting the `erichough/nfs-server` image will launch an NFS server. You'll need to supply some information upon container startup, which we'll cover below, but briefly speaking your `docker run` command might look something like this:
+## 快速开始
 
-    docker run                                            \
-      -v /host/path/to/shared/files:/some/container/path  \
-      -v /host/path/to/exports.txt:/etc/exports:ro        \
-      --cap-add SYS_ADMIN                                 \
-      -p 2049:2049                                        \
-      erichough/nfs-server
+### 方式 1：默认同时支持 NFSv3 和 NFSv4
 
-Let's break that command down into its individual pieces to see what's required for a successful server startup.
+如果你想先用最少配置把服务跑起来，同时让服务端默认提供 `NFSv3` 和 `NFSv4`，可以直接这样启动：
 
-1. **Provide the files to be shared over NFS**
+```bash
+nerdctl run --net host --privileged \
+  -v /data:/data \
+  -e NFS_EXPORT_0='/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check,fsid=0)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
 
-   As noted in the [requirements](#requirements), the container will need local access to the files you'd like to share over NFS. Some ideas for supplying these files:
+这里没有额外设置 `NFS_VERSION` 或 `NFS_DISABLE_VERSION_3`，所以会按默认行为同时提供 `NFSv3` 和 `NFSv4`。
 
-      * [bind mounts](https://docs.docker.com/storage/bind-mounts/) (`-v /host/path/to/shared/files:/some/container/path`)
-      * [volumes](https://docs.docker.com/storage/volumes/) (`-v some_volume:/some/container/path`)
-      * files [baked into](https://docs.docker.com/engine/reference/builder/#copy) custom image (e.g. in a `Dockerfile`: `COPY /host/files /some/container/path`)
+客户端挂载方式：
 
-   You may use any combination of the above, or any other means to supply files to the container.
+```bash
+# NFSv3
+mount -t nfs -o nfsvers=3 127.0.0.1:/data /mnt
 
-1. **Provide your desired [NFS exports](https://linux.die.net/man/5/exports) (`/etc/exports`)**
+# NFSv4
+mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
+```
 
-   You'll need to tell the server which **container directories** to share. You have *three options* for this; choose whichever one you prefer:
+注意：这套配置里，`/data` 被作为 `NFSv4` 根导出，所以 `NFSv3` 和 `NFSv4` 的客户端挂载路径不一样：
 
-   1. bind mount `/etc/exports` into the container
+- `NFSv3` 挂 `server:/data`
+- `NFSv4` 挂 `server:/`
 
-          docker run                                      \
-            -v /host/path/to/exports.txt:/etc/exports:ro  \
-            ...                                           \
-            erichough/nfs-server
+如果你希望 `NFSv4` 客户端也挂载 `server:/data`，看下面的方式 3。
 
-   1. provide each line of `/etc/exports` as an environment variable
+### 方式 2：只提供 NFSv3，最简单
 
-       The container will look for environment variables that start with `NFS_EXPORT_` and end with an integer. e.g. `NFS_EXPORT_0`, `NFS_EXPORT_1`, etc.
+如果你只需要 `NFSv3`，并且希望客户端直接挂载 `server:/data`，这是最直观的方式：
 
-          docker run                                                                       \
-            -e NFS_EXPORT_0='/container/path/foo                  *(ro,no_subtree_check)'  \
-            -e NFS_EXPORT_1='/container/path/bar 123.123.123.123/32(rw,no_subtree_check)'  \
-            ...                                                                            \
-            erichough/nfs-server
+```bash
+nerdctl run --net host --privileged \
+  -v /data:/data \
+  -e NFS_VERSION=3 \
+  -e NFS_EXPORT_0='/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
 
-   1. bake `/etc/exports` into a custom image
+客户端挂载：
 
-       e.g. in a `Dockerfile`:
+```bash
+mount -t nfs -o nfsvers=3 127.0.0.1:/data /mnt
+```
 
-       ```Dockerfile
-       FROM erichough/nfs-server
-       ADD /host/path/to/exports.txt /etc/exports
-       ```
+### 方式 3：只提供 NFSv4，并保留客户端挂载路径 `/data`
 
-1. **Use `--cap-add SYS_ADMIN` or `--privileged`**
+如果你希望客户端继续挂载：
 
-   As noted in the [requirements](#requirements), the container will need additional privileges. So your `run` command will need *either*:
+```bash
+127.0.0.1:/data
+```
 
-       docker run --cap-add SYS_ADMIN ... erichough/nfs-server
-       
-    or
+那么推荐显式构造一个 `NFSv4` 根：
 
-       docker run --privileged ... erichough/nfs-server
+```bash
+nerdctl run --net host --privileged \
+  -v /data:/exports/data \
+  -e NFS_DISABLE_VERSION_3=1 \
+  -e NFS_EXPORT_0='/exports *(ro,fsid=0,crossmnt,no_subtree_check)' \
+  -e NFS_EXPORT_1='/exports/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
 
-    Not sure which to use? Go for `--cap-add SYS_ADMIN` as it's the lesser of two evils.
+客户端挂载：
 
-1. **Expose the server ports**
+```bash
+mount -t nfs -o nfsvers=4.1 127.0.0.1:/data /mnt
+```
 
-   You'll need to open up at least one server port for your client connections. The ports listed in the examples below are the defaults used by this image and most can be [customized](https://github.com/ehough/docker-nfs-server/blob/develop/doc/advanced/ports.md).
+### 方式 4：只提供 NFSv4，把 `/data` 直接当根
 
-   * If your clients connect via **NFSv4 only**, you can get by with just TCP port `2049`:
+如果你可以接受客户端挂载 `server:/`，配置会更短：
 
-         docker run -p 2049:2049 ... erichough/nfs-server
+```bash
+nerdctl run --net host --privileged \
+  -v /data:/data \
+  -e NFS_DISABLE_VERSION_3=1 \
+  -e NFS_EXPORT_0='/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check,fsid=0)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
 
-   * If you'd like to support **NFSv3**, you'll need to expose a lot more ports:
+客户端挂载：
 
-         docker run                          \
-           -p 2049:2049   -p 2049:2049/udp   \
-           -p 111:111     -p 111:111/udp     \
-           -p 32765:32765 -p 32765:32765/udp \
-           -p 32767:32767 -p 32767:32767/udp \
-           ...                               \
-           erichough/nfs-server
+```bash
+mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
+```
 
-If you pay close attention to each of the items in this section, the server should start quickly and be ready to accept your NFS clients.
+## 常用环境变量
 
-### Mounting filesystems from a client
+| 变量名 | 作用 |
+| --- | --- |
+| `NFS_EXPORT_0`, `NFS_EXPORT_1`... | 每个变量对应一行 `/etc/exports` |
+| `NFS_VERSION` | 指定协议版本，可用值：`3`、`4`、`4.1`、`4.2` |
+| `NFS_DISABLE_VERSION_3` | 设为非空值后禁用 `NFSv3` |
+| `NFS_LOG_LEVEL` | `INFO` 或 `DEBUG` |
+| `NFS_SERVER_THREAD_COUNT` | 指定 `rpc.nfsd` 线程数 |
 
-    # mount <container-IP>:/some/export /some/local/path
+## FAQ
 
-## Optional Features
+### 为什么 `showmount -e` 正常，通过NFS v3 也能挂载，但 `NFSv4` 挂载 `:/data` 失败？(提示: mounting 127.0.0.1:/xxxx failed, reason given by server: No such file or directory)
 
-  * [Debug logging](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/logging.md)
-  * [Kerberos security](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/kerberos.md)
-  * [NFSv4 user ID mapping](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/nfs4-user-id-mapping.md)
-  * [AppArmor integration](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/apparmor.md)
+这是 `NFSv3` 和 `NFSv4` 的路径语义不同，不一定是服务没起来。
 
-## Advanced
+- `NFSv3` 更接近“按导出路径直接挂”
+- `NFSv4` 走的是 pseudo-root，客户端看到的路径是相对于 `fsid=0` 根来的
 
-  * [automatically load required kernel modules](https://github.com/ehough/docker-nfs-server/blob/develop/doc/feature/auto-load-kernel-modules.md)
-  * [customizing which ports are used](https://github.com/ehough/docker-nfs-server/blob/develop/doc/advanced/ports.md)
-  * [customizing NFS versions offered](https://github.com/ehough/docker-nfs-server/blob/develop/doc/advanced/nfs-versions.md)
-  * [performance tuning](https://github.com/ehough/docker-nfs-server/blob/develop/doc/advanced/performance-tuning.md)
+例如下面这组导出：
 
-## Help!
+```bash
+-e NFS_EXPORT_0='/exports *(ro,fsid=0,crossmnt,no_subtree_check)'
+-e NFS_EXPORT_1='/exports/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check)'
+```
 
-Please [open an issue](https://github.com/ehough/docker-nfs-server/issues) if you have any questions, constructive criticism, or can't get something to work.
+客户端看到的路径关系其实是：
 
-## Remaining tasks
+```txt
+服务器真实路径            客户端看到的路径
+/exports                  /
+/exports/data             /data
+```
 
-- figure out why `rpc.nfsd` [takes 5 minutes to startup/timeout](https://www.spinics.net/lists/linux-nfs/msg59728.html) unless `rpcbind` is running
-- add more examples
+所以客户端挂载 `127.0.0.1:/data` 时，实际访问的是服务器里的 `/exports/data`，不是 `/data`。
 
-## Acknowledgements
+如果你只是导出了：
 
-This work was based on prior projects:
+```bash
+-e NFS_EXPORT_0='/data *(rw,...)'
+```
+
+那它对 `NFSv3` 通常没问题，但对 `NFSv4` 不一定成立。
+
+PS: 根据man page说明，showmount 对 NFSv4 的支持也不太完善，所以它的输出不一定能反映实际的导出状态。
+> BUGS  
+> 
+>       The completeness and accuracy of the information that showmount
+>       displays varies according to the NFS server's implementation.
+>
+>       Because showmount sorts and uniqs the output, it is impossible to
+>       determine from the output whether a client is mounting the same
+>       directory more than once.
+>
+>       showmount works by contacting the server's MNT service directly.
+>       NFSv4-only servers have no need to advertise their exported root
+>       filehandles via this method, and may not expose their MNT service
+>       to clients.
+也就是说，在 NFSv4-only 的情况下，showmount 可能无法列出任何导出目录。
+
+### 为什么会报 `exportfs: /nfs does not support NFS export`？
+
+这通常不是目录名的问题，而是这个目录所在的底层文件系统不支持被 NFS 导出。
+
+最常见的容器场景是：
+
+```bash
+nerdctl run --net host --privileged \
+  -v /data:/nfs/data \
+  -e NFS_EXPORT_0='/nfs *(ro,fsid=0,crossmnt,no_subtree_check)' \
+  -e NFS_EXPORT_1='/nfs/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
+
+这里：
+
+- `/nfs/data` 是宿主机挂进来的目录
+- `/nfs` 本身往往还是容器根文件系统上的目录
+- 容器根文件系统在很多运行时里通常是 `overlayfs`
+
+而 `overlayfs` 往往不能直接作为 NFS 导出根，所以 `exportfs` 会报：
+
+```txt
+exportfs: /nfs does not support NFS export
+```
+
+要点是：不是“有的目录名不行”，而是“有的目录所在文件系统不支持导出”。
+
+你可以在容器里这样检查：
+
+```bash
+stat -f -c %T /nfs
+stat -f -c %T /nfs/data
+```
+
+常见结果会是：
+
+- `/nfs` 是 `overlayfs`
+- `/nfs/data` 是宿主机上的本地文件系统，例如 `ext4`、`xfs`、`btrfs`
+
+#### 解决方法 1：把真正的数据目录直接作为 `NFSv4` 根
+
+如果你能接受客户端挂载 `server:/`，最简单的做法就是不要导出 `/nfs`，而是直接导出 `/nfs/data`：
+
+```bash
+nerdctl run --net host --privileged \
+  -v /data:/nfs/data \
+  -e NFS_DISABLE_VERSION_3=1 \
+  -e NFS_EXPORT_0='/nfs/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check,fsid=0)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
+
+客户端挂载：
+
+```bash
+mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
+```
+
+#### 解决方法 2：如果你想让客户端继续挂载 `:/data`
+
+那就要保证 `fsid=0` 的父目录本身也来自一个可导出的宿主机文件系统，而不是容器里的 `overlayfs`：
+
+```bash
+mkdir -p /srv/nfs-root
+
+nerdctl run --net host --privileged \
+  -v /srv/nfs-root:/nfs \
+  -v /data:/nfs/data \
+  -e NFS_DISABLE_VERSION_3=1 \
+  -e NFS_EXPORT_0='/nfs *(ro,fsid=0,crossmnt,no_subtree_check)' \
+  -e NFS_EXPORT_1='/nfs/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
+
+这样客户端就可以继续挂载：
+
+```bash
+mount -t nfs -o nfsvers=4.1 127.0.0.1:/data /mnt
+```
+
+前提是 `/srv/nfs-root` 自己也在可导出的本地文件系统上。
+
+#### 解决方法 3：如果你只需要 `NFSv3`
+
+那就不必强行构造 `NFSv4` 根，直接导出实际目录会更简单：
+
+```bash
+nerdctl run --net host --privileged \
+  -v /data:/data \
+  -e NFS_VERSION=3 \
+  -e NFS_EXPORT_0='/data *(rw,sync,no_root_squash,all_squash,anonuid=0,anongid=0,no_subtree_check)' \
+  ghcr.io/san3xian/docker-nfs-server
+```
+
+### 为什么这里大多示例都用了 `--net host`？
+
+因为这样最省事，尤其是 `NFSv3`。
+
+如果不用 `host network`，你就需要自己处理端口映射。`NFSv4` 相对简单，通常至少要开放 TCP `2049`；`NFSv3` 还会涉及 `rpcbind`、`mountd`、`statd` 等附加端口。对大多数排障场景来说，先用 `--net host` 更直接。
+
+## 更多文档
+
+- [日志与调试](doc/feature/logging.md)
+- [自动加载内核模块](doc/feature/auto-load-kernel-modules.md)
+- [Kerberos](doc/feature/kerberos.md)
+- [NFSv4 用户 ID 映射](doc/feature/nfs4-user-id-mapping.md)
+- [AppArmor](doc/feature/apparmor.md)
+- [自定义 NFS 版本](doc/advanced/nfs-versions.md)
+- [自定义端口](doc/advanced/ports.md)
+- [性能调优](doc/advanced/performance-tuning.md)
+
+## 本地构建
+
+```bash
+nerdctl build -t docker-nfs-server:test .
+```
+
+## 致谢
 
 - [f-u-z-z-l-e/docker-nfs-server](https://github.com/f-u-z-z-l-e/docker-nfs-server)
 - [sjiveson/nfs-server-alpine](https://github.com/sjiveson/nfs-server-alpine)
+- [erichough/nfs-server](https://github.com/ehough/docker-nfs-server)
