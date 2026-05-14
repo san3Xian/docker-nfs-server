@@ -124,6 +124,151 @@ nerdctl run --net host --privileged \
 mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
 ```
 
+### 方式 5：Kubernetes 中让 NFSv3 和 NFSv4 使用相同挂载路径
+
+如果你希望客户端无论走 `NFSv3` 还是 `NFSv4`，都统一挂载：
+
+```bash
+server:/exports/model
+```
+
+那么在 Kubernetes 里，更稳的做法是：
+
+- 用一个单独的 `emptyDir` 作为 `NFSv4` pseudo-root
+- 把同一个 PVC 挂两次
+- 一次挂到 `NFSv4` 根下面，给 `NFSv4` 看
+- 一次挂到真实路径 `/exports`，给 `NFSv3` 看
+
+示例片段如下：
+
+```yaml
+hostNetwork: true
+containers:
+  - name: nfs-server
+    image: ghcr.io/san3xian/docker-nfs-server:latest
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+          - SYS_ADMIN
+    env:
+      - name: NFS_EXPORT_0
+        value: /nfs *(ro,sync,no_subtree_check,no_root_squash,fsid=0,crossmnt)
+      - name: NFS_EXPORT_1
+        value: /nfs/exports *(rw,sync,no_subtree_check,no_root_squash)
+      - name: NFS_EXPORT_2
+        value: /exports *(rw,sync,no_subtree_check,no_root_squash)
+      - name: MOUNTD_PORT
+        value: "20048"
+    ports:
+      - containerPort: 2049
+        name: nfs-tcp
+        protocol: TCP
+      - containerPort: 2049
+        name: nfs-udp
+        protocol: UDP
+      - containerPort: 111
+        name: rpcbind-tcp
+        protocol: TCP
+      - containerPort: 111
+        name: rpcbind-udp
+        protocol: UDP
+      - containerPort: 20048
+        name: mountd-tcp
+        protocol: TCP
+    volumeMounts:
+      - name: nfsv4-pseudo-root
+        mountPath: /nfs
+        readOnly: true
+      - name: nfs-storage
+        mountPath: /nfs/exports
+      - name: nfs-storage
+        mountPath: /exports
+volumes:
+  - name: nfsv4-pseudo-root
+    emptyDir:
+      sizeLimit: 128Mi
+  - name: nfs-storage
+    persistentVolumeClaim:
+      claimName: nfsdata
+```
+
+这套配置要求 `nfsdata` 这个 PVC 的根目录下直接就有 `model` 目录。这样：
+
+- `NFSv3` 客户端挂载 `server:/exports/model`
+- `NFSv4` 客户端挂载 `server:/exports/model`
+
+两边最终访问的是同一份数据。
+
+路径映射关系如下：
+
+```txt
+NFSv4 fsid=0 根         /nfs
+NFSv4 可见路径          /exports/model
+服务端真实路径          /nfs/exports/model
+NFSv3 真实导出路径      /exports/model
+```
+
+#### 为什么 Kubernetes 里通常要这样做
+
+一般来说，Pod 里的容器根文件系统通常是 `overlayfs`。所以如果你只是把一个卷挂到：
+
+```txt
+/nfs/data
+```
+
+然后再尝试把：
+
+```txt
+/nfs
+```
+
+作为 `fsid=0` 导出，往往会有问题。因为这时：
+
+- `/nfs/data` 是 PVC
+- 但 `/nfs` 本身仍然是容器根文件系统上的目录
+- 它很可能就是 `overlayfs`
+- `overlayfs` 往往不能作为稳定的 NFS 导出根(会遇到not support NFS export的错误)
+
+所以 Kubernetes 里更常见、更稳的做法就是：
+
+- 单独准备一个 `emptyDir` 或其他可写目录作为 pseudo-root
+- 再把真正的数据卷挂到 pseudo-root 下面
+
+#### 不用 `emptyDir` 也可以，但前提要看清楚
+
+如果你不想用 `emptyDir`，也可以把一个可导出的卷直接挂到 `fsid=0` 根本身，例如 `/data`。但这里有一个很容易写错的点：
+
+- 如果 `fsid=0` 是 `/data`
+- 那么 `NFSv4` 客户端看到的是“相对于 `/data` 的路径”
+- 不是服务器上的绝对路径 `/data/...`
+
+也就是说，如果你只是把卷挂到 `/data`，然后期望客户端通过 `NFSv4` 挂载：
+
+```txt
+server:/data/nfs
+```
+
+这通常是不成立的；对 `NFSv4` 来说，更自然的可见路径会是：
+
+```txt
+server:/nfs
+```
+
+如果你真的想在“不用 `emptyDir`”的情况下，仍然让 `NFSv3` 和 `NFSv4` 都统一成：
+
+```txt
+server:/exports/nfs
+```
+
+那你仍然需要同时满足两件事：
+
+- `fsid=0` 根下面存在 `/exports/nfs`
+- `NFSv3` 视角下也存在真实导出路径 `/exports/nfs`
+
+也就是说，本质上还是要为 `NFSv4` 的 pseudo-root 和 `NFSv3` 的真实导出路径同时准备好对应的目录结构，而不是只改一个挂载点名字就够了。
+
 ## 常用环境变量
 
 | 变量名 | 作用 |
