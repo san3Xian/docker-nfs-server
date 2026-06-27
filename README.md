@@ -127,10 +127,10 @@ mount -t nfs -o nfsvers=4.1 127.0.0.1:/ /mnt
 
 ### 方式 5：Kubernetes 中让 NFSv3 和 NFSv4 使用相同挂载路径
 
-如果你希望客户端无论走 `NFSv3` 还是 `NFSv4`，都统一挂载：
+如果你希望客户端无论走 `NFSv3` 还是 `NFSv4`，都统一挂载路径：
 
 ```bash
-server:/exports/model
+server:/exports/
 ```
 
 那么在 Kubernetes 里，更稳的做法是：
