@@ -15,7 +15,7 @@
 
 ## 前置条件
 
-1. 宿主机内核需要支持并加载这些模块：
+1. 宿主机内核需要支持并加载这些模块(`modprobe nfs nfsd`)：
    `nfs`、`nfsd`
 
    如果要用 Kerberos，还需要：
@@ -143,56 +143,120 @@ server:/exports/model
 示例片段如下：
 
 ```yaml
-hostNetwork: true
-containers:
-  - name: nfs-server
-    image: ghcr.io/san3xian/docker-nfs-server:latest
-    imagePullPolicy: IfNotPresent
-    securityContext:
-      privileged: true
-      capabilities:
-        add:
-          - SYS_ADMIN
-    env:
-      - name: NFS_EXPORT_0
-        value: /nfs *(ro,sync,no_subtree_check,no_root_squash,fsid=0,crossmnt)
-      - name: NFS_EXPORT_1
-        value: /nfs/exports *(rw,sync,no_subtree_check,no_root_squash)
-      - name: NFS_EXPORT_2
-        value: /exports *(rw,sync,no_subtree_check,no_root_squash)
-      - name: MOUNTD_PORT
-        value: "20048"
-    ports:
-      - containerPort: 2049
-        name: nfs-tcp
-        protocol: TCP
-      - containerPort: 2049
-        name: nfs-udp
-        protocol: UDP
-      - containerPort: 111
-        name: rpcbind-tcp
-        protocol: TCP
-      - containerPort: 111
-        name: rpcbind-udp
-        protocol: UDP
-      - containerPort: 20048
-        name: mountd-tcp
-        protocol: TCP
-    volumeMounts:
-      - name: nfsv4-pseudo-root
-        mountPath: /nfs
-        readOnly: true
-      - name: nfs-storage
-        mountPath: /nfs/exports
-      - name: nfs-storage
-        mountPath: /exports
-volumes:
-  - name: nfsv4-pseudo-root
-    emptyDir:
-      sizeLimit: 128Mi
-  - name: nfs-storage
-    persistentVolumeClaim:
-      claimName: nfsdata
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: nfs-server
+  namespace: storage-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nfs-server
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: nfs-server
+    spec:
+      volumes:
+        - name: nfsv4-pseudo-root
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: nfs-storage
+          persistentVolumeClaim:
+            claimName: nfs-server-data
+      containers:
+        - name: nfs-server
+          image: ghcr.io/san3xian/docker-nfs-server:latest
+          ports:
+            - name: nfs-tcp
+              containerPort: 2049
+              protocol: TCP
+            - name: nfs-udp
+              containerPort: 2049
+              protocol: UDP
+            - name: rpcbind-tcp
+              containerPort: 111
+              protocol: TCP
+            - name: rpcbind-udp
+              containerPort: 111
+              protocol: UDP
+            - name: mountd-tcp
+              containerPort: 20048
+              protocol: TCP
+          env:
+            - name: NFS_EXPORT_0
+              value: /nfs *(ro,sync,no_subtree_check,no_root_squash,fsid=0,crossmnt)
+            - name: NFS_EXPORT_1
+              value: /nfs/exports *(rw,sync,no_subtree_check,no_root_squash)
+            - name: NFS_EXPORT_2
+              value: /exports *(rw,sync,no_subtree_check,no_root_squash)
+            - name: MOUNTD_PORT
+              value: '20048'
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          volumeMounts:
+            - name: nfsv4-pseudo-root
+              mountPath: /nfs
+            - name: nfs-storage
+              mountPath: /nfs/exports
+            - name: nfs-storage
+              mountPath: /exports
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: FallbackToLogsOnError
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - SYS_ADMIN
+            privileged: true
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      hostNetwork: true
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: nfs-server
+  namespace: storage-system
+spec:
+  ports:
+    - name: nfs-tcp-2049
+      protocol: TCP
+      port: 2049
+      targetPort: 2049
+    - name: nfs-udp-2049
+      protocol: UDP
+      port: 2049
+      targetPort: 2049
+    - name: rpcbind-tcp-111
+      protocol: TCP
+      port: 111
+      targetPort: 111
+    - name: rpcbind-udp-111
+      protocol: UDP
+      port: 111
+      targetPort: 111
+    - name: mountd-tcp-20048
+      protocol: TCP
+      port: 20048
+      targetPort: 20048
+  selector:
+    app: nfs-server
+  type: ClusterIP
+  sessionAffinity: None
+  internalTrafficPolicy: Cluster
 ```
 
 这套配置要求 `nfsdata` 这个 PVC 的根目录下直接就有 `model` 目录。这样：
